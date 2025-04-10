@@ -2,7 +2,7 @@
 
 DEVICE: PIXEL XL API 28
 
-DEMO Youtube:
+DEMO Youtube: https://www.youtube.com/watch?v=U3-LGtWAUbQ
 
 INTERFACES:
 
