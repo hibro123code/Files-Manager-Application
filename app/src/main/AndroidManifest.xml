@@ -26,6 +26,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".FolderPickerActivity"
+            android:exported="false"
+            android:label="Select Folder" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="com.example.filemanagerapplication.provider"
@@ -33,7 +38,7 @@
             android:grantUriPermissions="true">
         <meta-data
             android:name="android.support.FILE_PROVIDER_PATHS"
-            android:resource="@xml/file_paths" /> <!-- Tham chiếu đến tệp res/xml/file_paths.xml -->
+            android:resource="@xml/file_paths" />
          </provider>
 
     </application>
