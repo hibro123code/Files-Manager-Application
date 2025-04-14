@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Cho phép chia sẻ từ thư mục gốc bộ nhớ ngoài -->
+    <external-path name="external_files" path="."/>
+    <!-- Bạn có thể cần thêm các đường dẫn khác tùy thuộc vào nơi bạn lưu trữ/truy cập tệp -->
+    <!-- Ví dụ: <cache-path name="cache_files" path="." /> -->
+    <!-- Ví dụ: <files-path name="internal_files" path="." /> -->
+</paths>
