@@ -4,6 +4,11 @@ DEVICE: PIXEL XL API 28
 
 DEMO Youtube: https://www.youtube.com/watch?v=U3-LGtWAUbQ
 
+Update 15/4/2025 !!!
+- Add Commpressed/Decompress file or folder (Just zip file).
+- Add more icon for typical file type.
+- Add Copy file or folder.
+
 INTERFACES:
 
 ![Screenshot 2025-04-10 120733](https://github.com/user-attachments/assets/b3546fe5-429c-4662-a45d-ed02791e305d) ![Screenshot 2025-04-10 120843](https://github.com/user-attachments/assets/3a1b6c5a-d426-4684-b292-f07e51026a74)
@@ -30,11 +35,15 @@ FUNCTIONS:
 
     ![image](https://github.com/user-attachments/assets/26dc1d83-baed-46a3-aeb8-4fd4bf23a967) ![image](https://github.com/user-attachments/assets/34f66bff-5d54-439d-a9ac-08c7d5c45bb5)
 
+  + Copy
+   ![image](https://github.com/user-attachments/assets/8aa9e511-ca45-4b26-b549-f533d35d4972) ![image](https://github.com/user-attachments/assets/6e8de26b-3bc6-448f-834b-2ccc28464fd1)
 
-Update 15/4/2025 !!!
-- Add Commpressed/Decompress file or folder (Just zip file).
-- Add more icon for typical file type.
-- Add Copy file or folder.
+  + Compress
+ ![image](https://github.com/user-attachments/assets/a24332d6-7a3e-4d81-bc14-55444aa01a5e)
+
+
+
+
 
 
 
