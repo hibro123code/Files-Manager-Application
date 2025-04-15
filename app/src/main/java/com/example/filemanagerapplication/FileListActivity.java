@@ -64,10 +64,12 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
     private List<File> fileList;
     private String currentPath; // Stores the absolute path of the currently displayed directory
 
-    // --- State for Move Operation ---
-    private File fileToMovePending; // Holds the file/folder selected for moving, awaiting destination selection
+    // --- State for Move/Copy Operation ---
+    // private File fileToMovePending; // Holds the file/folder selected for moving, awaiting destination selection
     private ActivityResultLauncher<Intent> customFolderPickerLauncher; // Handles the result from FolderPickerActivity
-
+    private enum OperationType { NONE, COPY, MOVE } // Enum để phân biệt thao tác
+    private File fileToOperatePending = null;      // File đang chờ xử lý (cho cả copy và move)
+    private OperationType pendingOperation = OperationType.NONE; // Trạng thái hiện tại
     /**
      * Initializes the activity, sets up the UI, configures the RecyclerView,
      * determines the initial path to display, sets up the ActivityResultLauncher
@@ -86,59 +88,82 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
         recyclerView = findViewById(R.id.recycler_view);
         pathTextView = findViewById(R.id.path_text_view);
         noFilesTextView = findViewById(R.id.nofiles_textview);
-        fabAddFolder = findViewById(R.id.fab_add_folder);
+        fabAddFolder = findViewById(R.id.fab_add_folder); // Khởi tạo FAB
         fileList = new ArrayList<>();
 
-        // --- Setup ActivityResultLauncher for Custom Folder Picker ---
-        // This launcher waits for the result from FolderPickerActivity.
+        // --- Setup ActivityResultLauncher for Custom Folder Picker (CẬP NHẬT CALLBACK) ---
         customFolderPickerLauncher = registerForActivityResult(
                 new ActivityResultContracts.StartActivityForResult(),
                 result -> {
-                    // Check if the result is OK and data is present
+                    // --- Xử lý kết quả từ FolderPicker ---
                     if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
-                        // Extract the selected destination path from the result Intent
                         String selectedPath = result.getData().getStringExtra(FolderPickerActivity.EXTRA_SELECTED_PATH);
                         if (selectedPath != null && !selectedPath.isEmpty()) {
                             File destinationDirectory = new File(selectedPath);
-                            // If a file was pending movement, execute the move operation
-                            if (fileToMovePending != null) {
-                                handleMoveOperationFileBased(fileToMovePending, destinationDirectory);
+
+                            // --- Kiểm tra trạng thái và file đang chờ ---
+                            if (fileToOperatePending != null && pendingOperation != OperationType.NONE) {
+                                Log.d(TAG, "FolderPicker returned destination: " + selectedPath + " for operation: " + pendingOperation);
+
+                                // --- Gọi hàm xử lý tương ứng ---
+                                if (pendingOperation == OperationType.MOVE) {
+                                    handleMoveOperationFileBased(fileToOperatePending, destinationDirectory);
+                                } else if (pendingOperation == OperationType.COPY) {
+                                    if (adapter != null) {
+                                        adapter.performCopy(fileToOperatePending, destinationDirectory);
+                                    } else {
+                                        Log.e(TAG, "Adapter is null, cannot perform copy operation.");
+                                        Toast.makeText(this, "Error: Copy failed (Internal error).", Toast.LENGTH_SHORT).show();
+                                    }
+                                }
                             } else {
-                                Log.w(TAG, "Folder picker returned OK, but no file was pending move.");
+                                // Trạng thái không hợp lệ khi nhận kết quả OK
+                                Log.w(TAG, "Folder picker returned OK, but state is invalid (pendingFile=" + fileToOperatePending + ", pendingOp=" + pendingOperation + ")");
+                                Toast.makeText(this, "Operation cancelled or invalid state.", Toast.LENGTH_SHORT).show();
                             }
                         } else {
+                            // Đường dẫn trả về không hợp lệ
                             Log.w(TAG, "Folder picker returned OK, but selected path was null or empty.");
-                            if (fileToMovePending != null) Toast.makeText(this, "Move failed: Invalid destination.", Toast.LENGTH_SHORT).show();
+                            if (pendingOperation != OperationType.NONE) // Chỉ báo lỗi nếu có thao tác chờ
+                                Toast.makeText(this, "Operation failed: Invalid destination.", Toast.LENGTH_SHORT).show();
                         }
                     } else {
-                        // Handle cancellation or failure from the picker
-                        if (fileToMovePending != null) {
-                            Toast.makeText(this, "Move operation cancelled.", Toast.LENGTH_SHORT).show();
+                        // Người dùng hủy hoặc có lỗi từ picker
+                        if (pendingOperation != OperationType.NONE) { // Chỉ báo hủy nếu có thao tác chờ
+                            Toast.makeText(this, "Operation cancelled.", Toast.LENGTH_SHORT).show();
                         }
                         Log.d(TAG, "Folder picker cancelled or returned no data. Result Code: " + result.getResultCode());
                     }
-                    // Clear the pending move state regardless of the outcome
-                    fileToMovePending = null;
+
+                    // --- Quan trọng: Reset trạng thái bất kể kết quả ---
+                    fileToOperatePending = null;
+                    pendingOperation = OperationType.NONE;
                 });
+        // -----------------------------------------------------------
 
         // Setup RecyclerView
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
-        adapter = new MyAdapter(this, fileList, this); // Pass 'this' as the listener
+        // Khởi tạo adapter, truyền 'this' làm listener
+        adapter = new MyAdapter(this, fileList, this);
         recyclerView.setAdapter(adapter);
 
-        // Determine initial path: Use intent path or fallback to app-specific external/internal dir
+        // Determine initial path (giữ nguyên logic cũ)
         String pathFromIntent = getIntent().getStringExtra("path");
         if (pathFromIntent != null && !pathFromIntent.isEmpty()) {
             currentPath = pathFromIntent;
         } else {
-            File externalFilesDir = getExternalFilesDir(null); // App-specific external storage
-            currentPath = (externalFilesDir != null) ? externalFilesDir.getAbsolutePath() : getFilesDir().getAbsolutePath(); // Fallback to internal
+            File externalFilesDir = getExternalFilesDir(null);
+            currentPath = (externalFilesDir != null && externalFilesDir.canRead()) ? externalFilesDir.getAbsolutePath() : getFilesDir().getAbsolutePath();
             Log.d(TAG, "No path in intent, starting at default: " + currentPath);
         }
 
-        updateActivityTitle(); // Set initial title based on path
-        checkAndRequestPermissions(); // Check/request storage permissions before loading files
-        fabAddFolder.setOnClickListener(v -> showCreateFolderDialog()); // FAB action
+        // --- Cập nhật UI và Kiểm tra Quyền ---
+        updateActivityTitle(); // Đặt tiêu đề ban đầu
+        // Quan trọng: Kiểm tra quyền trước khi cố gắng load file
+        checkAndRequestPermissions(); // Sẽ gọi loadFilesAndFolders nếu có quyền
+
+        // --- Thiết lập Listener cho FAB ---
+        fabAddFolder.setOnClickListener(v -> showCreateFolderDialog()); // Đảm bảo bạn có hàm này
     }
 
     /**
@@ -429,7 +454,7 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
         }
 
         Log.d(TAG, "Move requested for: " + fileToMove.getAbsolutePath());
-        this.fileToMovePending = fileToMove; // Store the file awaiting destination
+        this.fileToOperatePending = fileToMove; // Store the file awaiting destination
 
         // --- Launch Custom Folder Picker ---
         Intent intent = new Intent(this, FolderPickerActivity.class);
@@ -443,7 +468,7 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
         } catch (ActivityNotFoundException e) {
             Log.e(TAG, "FolderPickerActivity not found!", e);
             Toast.makeText(this, "Error: Folder Picker component is missing.", Toast.LENGTH_LONG).show();
-            this.fileToMovePending = null; // Clear pending state as picker cannot be launched
+            this.fileToOperatePending = null; // Clear pending state as picker cannot be launched
         }
     }
 
@@ -574,6 +599,86 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
             // If it failed after all attempts
             Log.e(TAG, "Move operation ultimately failed for: " + sourceFile.getName());
             // Toast message should have been shown by the specific failure point
+        }
+    }
+    @Override
+    public void onRequestCopy(File fileToCopy) {
+        if (fileToCopy == null) {
+            Log.e(TAG, "onRequestCopy called with null file.");
+            return;
+        }
+        if (!fileToCopy.exists()) {
+            Toast.makeText(this, "Cannot copy: Source file not found.", Toast.LENGTH_SHORT).show();
+            Log.e(TAG, "onRequestCopy: Source file does not exist: " + fileToCopy.getAbsolutePath());
+            loadFilesAndFolders(); // Refresh lại list
+            return;
+        }
+
+        Log.d(TAG, "Copy requested for: " + fileToCopy.getAbsolutePath());
+        this.fileToOperatePending = fileToCopy;     // Sử dụng biến chung
+        this.pendingOperation = OperationType.COPY; // Đặt trạng thái
+
+        // --- Khởi chạy FolderPickerActivity tương tự như Move ---
+        Intent intent = new Intent(this, FolderPickerActivity.class);
+        // Vẫn dùng EXTRA_SOURCE_PATH_TO_MOVE cho mục đích validation bên trong Picker
+        intent.putExtra(FolderPickerActivity.EXTRA_SOURCE_PATH_TO_MOVE, fileToCopy.getAbsolutePath());
+        intent.putExtra(FolderPickerActivity.EXTRA_INITIAL_PATH, currentPath);
+
+        try {
+            customFolderPickerLauncher.launch(intent); // Sử dụng cùng launcher
+        } catch (ActivityNotFoundException e) {
+            Log.e(TAG, "FolderPickerActivity not found!", e);
+            Toast.makeText(this, "Error: Folder Picker component is missing.", Toast.LENGTH_LONG).show();
+            // Reset trạng thái nếu không mở được picker
+            this.fileToOperatePending = null;
+            this.pendingOperation = OperationType.NONE;
+        }
+    }
+    @Override
+    public void onOperationComplete(File directoryAffected) {
+        // Được gọi bởi Adapter sau khi nén, giải nén, xóa, đổi tên thành công
+        Log.d("FileListActivity", "Operation complete notification received.");
+        Log.d("FileListActivity", "Directory affected: " + (directoryAffected != null ? directoryAffected.getAbsolutePath() : "null"));
+        Log.d("FileListActivity", "Current path: " + currentPath);
+
+        // Quyết định xem có cần làm mới giao diện hiện tại hay không
+        File currentDirFile = new File(currentPath);
+        boolean shouldRefresh = false;
+
+        if (directoryAffected != null) {
+            // 1. Làm mới nếu thư mục bị ảnh hưởng chính là thư mục đang xem
+            if (directoryAffected.getAbsolutePath().equals(currentPath)) {
+                Log.d("FileListActivity", "Refresh reason: Affected directory matches current path.");
+                shouldRefresh = true;
+            }
+            // 2. Làm mới nếu thư mục hiện tại nằm BÊN TRONG thư mục bị ảnh hưởng
+            // (Ví dụ: giải nén vào thư mục cha, hoặc xóa/đổi tên thư mục cha)
+            else if (currentPath.startsWith(directoryAffected.getAbsolutePath() + File.separator)) {
+                Log.d("FileListActivity", "Refresh reason: Current path is inside the affected directory.");
+                shouldRefresh = true;
+            }
+            // 3. (Tùy chọn) Làm mới nếu thư mục bị ảnh hưởng là cha trực tiếp
+            // (Hữu ích nếu bạn muốn cập nhật khi tên thư mục cha thay đổi chẳng hạn)
+            // else if (currentDirFile.getParentFile() != null && currentDirFile.getParentFile().equals(directoryAffected)) {
+            //     Log.d("FileListActivity", "Refresh reason: Affected directory is parent of current path.");
+            //     shouldRefresh = true;
+            // }
+
+        } else {
+            // 4. Làm mới như một fallback nếu không rõ thư mục nào bị ảnh hưởng
+            Log.w("FileListActivity", "Refresh reason: Affected directory is null (fallback).");
+            shouldRefresh = true;
+        }
+
+
+        if (shouldRefresh) {
+            Log.d("FileListActivity", "Executing refresh by calling loadFilesAndFolders().");
+            // --- THAY ĐỔI CHÍNH LÀ Ở ĐÂY ---
+            // Gọi phương thức làm mới hiện có của bạn
+            loadFilesAndFolders();
+            // ---------------------------------
+        } else {
+            Log.d("FileListActivity", "No refresh needed based on affected directory.");
         }
     }
 

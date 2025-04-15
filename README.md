@@ -31,6 +31,11 @@ FUNCTIONS:
     ![image](https://github.com/user-attachments/assets/26dc1d83-baed-46a3-aeb8-4fd4bf23a967) ![image](https://github.com/user-attachments/assets/34f66bff-5d54-439d-a9ac-08c7d5c45bb5)
 
 
+Update 15/4/2025 !!!
+- Add Commpressed/Decompress file or folder (Just zip file).
+- Add more icon for typical file type.
+- Add Copy file or folder.
+
 
 
 
