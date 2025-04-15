@@ -36,9 +36,11 @@ FUNCTIONS:
     ![image](https://github.com/user-attachments/assets/26dc1d83-baed-46a3-aeb8-4fd4bf23a967) ![image](https://github.com/user-attachments/assets/34f66bff-5d54-439d-a9ac-08c7d5c45bb5)
 
   + Copy
+    
    ![image](https://github.com/user-attachments/assets/8aa9e511-ca45-4b26-b549-f533d35d4972) ![image](https://github.com/user-attachments/assets/6e8de26b-3bc6-448f-834b-2ccc28464fd1)
 
   + Compress
+    
  ![image](https://github.com/user-attachments/assets/a24332d6-7a3e-4d81-bc14-55444aa01a5e)
 
 
