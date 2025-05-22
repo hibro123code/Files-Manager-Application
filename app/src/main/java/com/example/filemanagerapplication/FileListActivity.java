@@ -3,22 +3,26 @@ package com.example.filemanagerapplication;
 // Necessary Android framework imports
 import android.Manifest;
 import android.app.Activity;
+import android.app.ProgressDialog;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.net.Uri; // Required for MimeTypeMap interaction
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;                 // Import Handler
+import android.os.Looper;                  // Import Looper
 import android.os.Environment;
 import android.text.InputType;
 import android.util.Log;
 import android.view.View;
-import android.webkit.MimeTypeMap; // Required for getting MIME types
 import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.view.Menu;
+import android.view.MenuItem;
 
 // AndroidX and Material Design imports
+import androidx.activity.result.ActivityResult;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
@@ -29,8 +33,11 @@ import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 import com.google.android.material.floatingactionbutton.FloatingActionButton;
+import androidx.appcompat.view.ActionMode;
 
 // Java IO and Utility imports
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -41,14 +48,19 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;    // Import Executors
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
+
 
 /**
  * Activity responsible for displaying a list of files and folders within a directory.
  * It handles navigation between directories, requesting necessary storage permissions,
  * creating new folders, and initiating the file/folder move process using a custom picker.
- * Implements {@link FileOperationListener} to receive move requests from the adapter.
  */
-public class FileListActivity extends AppCompatActivity implements FileOperationListener {
+public class FileListActivity extends AppCompatActivity{
 
     private static final String TAG = "FileListActivity";
     private static final int REQUEST_CODE_PERMISSIONS = 101;
@@ -63,13 +75,17 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
     private MyAdapter adapter;
     private List<File> fileList;
     private String currentPath; // Stores the absolute path of the currently displayed directory
-
-    // --- State for Move/Copy Operation ---
-    // private File fileToMovePending; // Holds the file/folder selected for moving, awaiting destination selection
     private ActivityResultLauncher<Intent> customFolderPickerLauncher; // Handles the result from FolderPickerActivity
     private enum OperationType { NONE, COPY, MOVE } // Enum để phân biệt thao tác
-    private File fileToOperatePending = null;      // File đang chờ xử lý (cho cả copy và move)
+    private List<File> fileToOperatePending = null;      // File đang chờ xử lý (cho cả copy và move)
     private OperationType pendingOperation = OperationType.NONE; // Trạng thái hiện tại
+    private ActionMode currentActionMode;
+    private ActionMode.Callback actionModeCallback;
+    // --- KHAI BÁO ExecutorService và Handler ---
+    private ExecutorService executorService;
+    private Handler mainThreadHandler;
+    private ProgressDialog progressDialog;
+
     /**
      * Initializes the activity, sets up the UI, configures the RecyclerView,
      * determines the initial path to display, sets up the ActivityResultLauncher
@@ -89,63 +105,24 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
         pathTextView = findViewById(R.id.path_text_view);
         noFilesTextView = findViewById(R.id.nofiles_textview);
         fabAddFolder = findViewById(R.id.fab_add_folder); // Khởi tạo FAB
+
         fileList = new ArrayList<>();
-
-        // --- Setup ActivityResultLauncher for Custom Folder Picker (CẬP NHẬT CALLBACK) ---
-        customFolderPickerLauncher = registerForActivityResult(
-                new ActivityResultContracts.StartActivityForResult(),
-                result -> {
-                    // --- Xử lý kết quả từ FolderPicker ---
-                    if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
-                        String selectedPath = result.getData().getStringExtra(FolderPickerActivity.EXTRA_SELECTED_PATH);
-                        if (selectedPath != null && !selectedPath.isEmpty()) {
-                            File destinationDirectory = new File(selectedPath);
-
-                            // --- Kiểm tra trạng thái và file đang chờ ---
-                            if (fileToOperatePending != null && pendingOperation != OperationType.NONE) {
-                                Log.d(TAG, "FolderPicker returned destination: " + selectedPath + " for operation: " + pendingOperation);
-
-                                // --- Gọi hàm xử lý tương ứng ---
-                                if (pendingOperation == OperationType.MOVE) {
-                                    handleMoveOperationFileBased(fileToOperatePending, destinationDirectory);
-                                } else if (pendingOperation == OperationType.COPY) {
-                                    if (adapter != null) {
-                                        adapter.performCopy(fileToOperatePending, destinationDirectory);
-                                    } else {
-                                        Log.e(TAG, "Adapter is null, cannot perform copy operation.");
-                                        Toast.makeText(this, "Error: Copy failed (Internal error).", Toast.LENGTH_SHORT).show();
-                                    }
-                                }
-                            } else {
-                                // Trạng thái không hợp lệ khi nhận kết quả OK
-                                Log.w(TAG, "Folder picker returned OK, but state is invalid (pendingFile=" + fileToOperatePending + ", pendingOp=" + pendingOperation + ")");
-                                Toast.makeText(this, "Operation cancelled or invalid state.", Toast.LENGTH_SHORT).show();
-                            }
-                        } else {
-                            // Đường dẫn trả về không hợp lệ
-                            Log.w(TAG, "Folder picker returned OK, but selected path was null or empty.");
-                            if (pendingOperation != OperationType.NONE) // Chỉ báo lỗi nếu có thao tác chờ
-                                Toast.makeText(this, "Operation failed: Invalid destination.", Toast.LENGTH_SHORT).show();
-                        }
-                    } else {
-                        // Người dùng hủy hoặc có lỗi từ picker
-                        if (pendingOperation != OperationType.NONE) { // Chỉ báo hủy nếu có thao tác chờ
-                            Toast.makeText(this, "Operation cancelled.", Toast.LENGTH_SHORT).show();
-                        }
-                        Log.d(TAG, "Folder picker cancelled or returned no data. Result Code: " + result.getResultCode());
-                    }
-
-                    // --- Quan trọng: Reset trạng thái bất kể kết quả ---
-                    fileToOperatePending = null;
-                    pendingOperation = OperationType.NONE;
-                });
-        // -----------------------------------------------------------
+        executorService = Executors.newSingleThreadExecutor();
+        mainThreadHandler = new Handler(Looper.getMainLooper());
 
         // Setup RecyclerView
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
         // Khởi tạo adapter, truyền 'this' làm listener
-        adapter = new MyAdapter(this, fileList, this);
+        adapter = new MyAdapter(this, fileList);
         recyclerView.setAdapter(adapter);
+
+        customFolderPickerLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                // Gọi phương thức xử lý riêng
+                this::handleFolderPickerResult
+        );
+        // -----------------------------------------------------------
+
 
         // Determine initial path (giữ nguyên logic cũ)
         String pathFromIntent = getIntent().getStringExtra("path");
@@ -156,7 +133,7 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
             currentPath = (externalFilesDir != null && externalFilesDir.canRead()) ? externalFilesDir.getAbsolutePath() : getFilesDir().getAbsolutePath();
             Log.d(TAG, "No path in intent, starting at default: " + currentPath);
         }
-
+        setupActionModeCallback();
         // --- Cập nhật UI và Kiểm tra Quyền ---
         updateActivityTitle(); // Đặt tiêu đề ban đầu
         // Quan trọng: Kiểm tra quyền trước khi cố gắng load file
@@ -164,6 +141,665 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
 
         // --- Thiết lập Listener cho FAB ---
         fabAddFolder.setOnClickListener(v -> showCreateFolderDialog()); // Đảm bảo bạn có hàm này
+
+    }
+    /**
+     * Xử lý kết quả trả về từ FolderPickerActivity.
+     * Phương thức này sẽ được gọi bởi ActivityResultLauncher.
+     */
+    private void handleFolderPickerResult(ActivityResult result) {
+        if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
+            String selectedPath = result.getData().getStringExtra(FolderPickerActivity.EXTRA_SELECTED_PATH);
+            if (selectedPath != null && !selectedPath.isEmpty()) {
+                File destinationDirectory = new File(selectedPath);
+
+                // Kiểm tra trạng thái và danh sách file đang chờ
+                if (fileToOperatePending != null && !fileToOperatePending.isEmpty() && pendingOperation != OperationType.NONE) {
+                    Log.d(TAG, "FolderPicker returned destination: " + selectedPath + " for operation: " + pendingOperation + " on " + fileToOperatePending.size() + " items.");
+
+                    // Chạy các thao tác trên luồng nền
+                    // Sao chép danh sách để tránh ConcurrentModificationException nếu fileToOperatePending được sửa đổi ở nơi khác
+                    // Mặc dù ở đây nó được reset ngay sau đó, nhưng đây là một thói quen tốt.
+                    List<File> filesToProcess = new ArrayList<>(fileToOperatePending);
+                    OperationType operationToPerform = pendingOperation; // Lưu lại operation type
+
+                    // --- THÊM CODE HIỂN THỊ PROGRESSDIALOG ---
+                    progressDialog = new ProgressDialog(this);
+                    progressDialog.setTitle(operationToPerform.toString()); // "COPY" hoặc "MOVE"
+                    progressDialog.setMessage("Processing " + filesToProcess.size() + " item(s)...");
+                    progressDialog.setIndeterminate(true); // True nếu không có tiến trình cụ thể từng file
+                    progressDialog.setCancelable(false); // Tạm thời không cho hủy
+                    progressDialog.show();
+                    // -----------------------------------------
+
+                    executorService.execute(() -> {
+                        boolean allSuccessful = true;
+                        int successCount = 0;
+                        int failureCount = 0;
+                        String firstErrorMessage = null;
+
+                        for (File sourceFile : filesToProcess) {
+                            File actualDestination = new File(destinationDirectory, sourceFile.getName());
+                             actualDestination = getUniqueDestinationFile(actualDestination);
+
+                            if (operationToPerform == OperationType.MOVE) {
+                                // Giả sử handleMoveOperationFileBasedInternal cũng trả về boolean
+                                if (handleMoveOperationInternal(sourceFile, destinationDirectory)) {
+                                    successCount++;
+                                } else {
+                                    allSuccessful = false; failureCount++;
+                                    if(firstErrorMessage == null) firstErrorMessage = "Move failed for " + sourceFile.getName();
+                                    // Hàm handleMoveOperationInternal đã log lỗi chi tiết và có thể đã hiển thị Toast cho các lỗi validation ban đầu.
+                                }
+                            } else if (operationToPerform == OperationType.COPY) {
+                                if (copyFileOrDirectoryRecursiveInternal(sourceFile, actualDestination)) {
+                                    successCount++;
+                                    Log.d(TAG, "Successfully copied: " + sourceFile.getName());
+                                } else {
+                                    allSuccessful = false; failureCount++;
+                                    if(firstErrorMessage == null) firstErrorMessage = "Copy failed for " + sourceFile.getName();
+                                    // Hàm copyFileOrDirectoryRecursiveInternal đã log lỗi chi tiết
+                                }
+                            }
+                        } // Kết thúc vòng lặp for
+
+                        // Cập nhật UI trên luồng chính
+                        final boolean finalAllSuccessful = allSuccessful;
+                        final int finalSuccessCount = successCount;
+                        final int finalFailureCount = failureCount;
+                        final String finalFirstErrorMessage = firstErrorMessage;
+                        final OperationType finalOperationPerformed = operationToPerform; // Để dùng trong Toast
+
+                        mainThreadHandler.post(() -> {
+                            // --- THÊM CODE ẨN PROGRESSDIALOG ---
+                            if (progressDialog != null && progressDialog.isShowing()) {
+                                progressDialog.dismiss();
+                            }
+                            progressDialog = null; // Dọn dẹp tham chiếu
+                            // ---------------------------------
+                            if (finalAllSuccessful && finalFailureCount == 0) {
+                                Toast.makeText(this, finalOperationPerformed + " " + finalSuccessCount + " item(s) successful.", Toast.LENGTH_SHORT).show();
+                            } else {
+                                String message = finalOperationPerformed + " completed with " + finalSuccessCount + " success(es) and " + finalFailureCount + " failure(s).";
+                                if (finalFirstErrorMessage != null) {
+                                    message += "\nFirst error: " + finalFirstErrorMessage;
+                                }
+                                Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+                            }
+                            loadFilesAndFolders(); // Làm mới danh sách
+                        });
+                    }); // Kết thúc executorService.execute
+
+                } else {
+                    Log.w(TAG, "Folder picker returned OK, but state is invalid (pendingFile=" + fileToOperatePending + ", pendingOp=" + pendingOperation + ")");
+                    Toast.makeText(this, "Operation cancelled or invalid state.", Toast.LENGTH_SHORT).show();
+                }
+            } else {
+                Log.w(TAG, "Folder picker returned OK, but selected path was null or empty.");
+                if (pendingOperation != OperationType.NONE)
+                    Toast.makeText(this, "Operation failed: Invalid destination.", Toast.LENGTH_SHORT).show();
+            }
+        } else { // Result code không phải là RESULT_OK
+            if (pendingOperation != OperationType.NONE) {
+                Toast.makeText(this, "Operation cancelled.", Toast.LENGTH_SHORT).show();
+            }
+            Log.d(TAG, "Folder picker cancelled or returned no data. Result Code: " + result.getResultCode());
+        }
+
+        // Quan trọng: Reset trạng thái BẤT KỂ kết quả như thế nào
+        // Đặt ở đây đảm bảo nó luôn được gọi sau khi picker đóng lại.
+        fileToOperatePending = null;
+        pendingOperation = OperationType.NONE;
+    }
+    public void onSelectionModeChanged(boolean enabled) {
+        if (enabled) {
+            if (currentActionMode == null) {
+                currentActionMode = startSupportActionMode(actionModeCallback);
+            }
+            fabAddFolder.setVisibility(View.GONE); // Ẩn FAB khi ở chế độ chọn
+        } else {
+            if (currentActionMode != null) {
+                currentActionMode.finish(); // Kết thúc ActionMode
+                currentActionMode = null;
+            }
+            fabAddFolder.setVisibility(View.VISIBLE); // Hiện lại FAB
+        }
+    }
+    // --- Hàm được gọi từ Adapter khi số lượng mục chọn thay đổi ---
+    public void onSelectionChanged(int count) {
+        if (currentActionMode != null) {
+            //Log.d(TAG, "onSelectionChanged: " + count);
+            currentActionMode.setTitle(count + " selected");
+            currentActionMode.invalidate(); // Gọi onPrepareActionMode để cập nhật menu
+        }
+    }
+    private void setupActionModeCallback() {
+        actionModeCallback = new ActionMode.Callback() {
+            @Override
+            public boolean onCreateActionMode(ActionMode mode, Menu menu) {
+                // Inflate menu cho ActionMode (ví dụ: res/menu/selection_actions_menu.xml)
+                mode.getMenuInflater().inflate(R.menu.selection_actions_menu, menu);
+                return true; // Quan trọng, trả về true để hiển thị ActionMode
+            }
+
+            @Override
+            public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
+                // Cập nhật menu nếu cần (ví dụ: ẩn/hiện nút dựa trên số lượng chọn)
+                MenuItem deleteItem = menu.findItem(R.id.action_delete_selected);
+                MenuItem moveItem = menu.findItem(R.id.action_move_selected);
+                MenuItem copyItem = menu.findItem(R.id.action_copy_selected);
+                MenuItem compressItem = menu.findItem(R.id.action_compress_selected);
+                MenuItem extractItem = menu.findItem(R.id.action_extract_selected);
+                MenuItem renameItem = menu.findItem(R.id.action_rename_selected);
+
+                int selectedCount = adapter.getSelectedItemCount();
+                // Chỉ cho phép Move, Copy, Compress nếu có ít nhất 1 mục được chọn
+                if (deleteItem != null) deleteItem.setVisible(selectedCount > 0);
+                if (moveItem != null) moveItem.setVisible(selectedCount > 0);
+                if (copyItem != null) copyItem.setVisible(selectedCount > 0);
+                if (compressItem != null) compressItem.setVisible(selectedCount > 0);
+                if (renameItem != null) renameItem.setVisible(selectedCount == 1);
+                // --- Xử lý visibility cho nút EXTRACT ---
+                if (extractItem != null) {
+                    boolean isVisibleForExtract = false; // Mặc định là ẩn
+                    if (selectedCount == 1) {
+                        // Lấy mục duy nhất đã chọn
+                        List<File> selectedFiles = adapter.getSelectedItems(); // Hàm này trả về List
+                        if (!selectedFiles.isEmpty()) {
+                            File selectedFile = selectedFiles.get(0); // Lấy phần tử đầu tiên (và duy nhất)
+                            if (selectedFile.isFile() && selectedFile.getName().toLowerCase().endsWith(".zip")) {
+                                isVisibleForExtract = true;
+                            }
+                        }
+                    }
+                    extractItem.setVisible(isVisibleForExtract);
+                }
+                // ------------------------------------------
+                // Nút "Select All" có thể luôn hiển thị hoặc ẩn khi tất cả đã được chọn
+                return true;
+            }
+
+            @Override
+            public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
+                List<File> selectedFiles = adapter.getSelectedItems();
+                if (selectedFiles.isEmpty() && item.getItemId() != R.id.action_select_all) {
+                    Toast.makeText(FileListActivity.this, "No items selected.", Toast.LENGTH_SHORT).show();
+                    mode.finish(); // Thoát ActionMode
+                    return true;
+                }
+
+                int itemId = item.getItemId();
+                if (itemId == R.id.action_delete_selected) {
+                    handleDeleteSelected(selectedFiles);
+                    mode.finish(); // Kết thúc ActionMode sau khi hành động
+                    return true;
+                } else if (itemId == R.id.action_copy_selected) {
+                    handleCopySelected(selectedFiles);
+                    mode.finish();
+                    return true;
+                } else if (itemId == R.id.action_move_selected) {
+                    handleMoveSelected(selectedFiles);
+                    mode.finish();
+                    return true;
+                } else if (itemId == R.id.action_compress_selected) {
+                    handleCompressSelected(selectedFiles);
+                    mode.finish();
+                    return true;
+                } else if (itemId == R.id.action_extract_selected) {
+                    extractItem(selectedFiles.get(0));
+                    mode.finish();
+                    return true;
+                } else if (itemId == R.id.action_rename_selected) {
+                    showRenameDialog(selectedFiles.get(0));
+                    mode.finish();
+                    return true;
+                } else if (itemId == R.id.action_select_all) {
+                    adapter.selectAll();
+                    return true; // Không kết thúc mode
+                }
+                return false; // Hành động không được xử lý
+            }
+
+            @Override
+            public void onDestroyActionMode(ActionMode mode) {
+                // Được gọi khi ActionMode bị hủy (ví dụ: nhấn nút Back, hoặc gọi mode.finish())
+                currentActionMode = null;
+                adapter.setSelectionMode(false); // Đảm bảo thoát chế độ chọn trong adapter
+                fabAddFolder.setVisibility(View.VISIBLE); // Hiện lại FAB
+            }
+        };
+    }
+    // --- Các hàm xử lý hành động cho nhiều mục ---
+    private void handleDeleteSelected(List<File> filesToDelete) {
+        if (filesToDelete.isEmpty()) return;
+        // Hiển thị dialog xác nhận trước khi xóa nhiều mục
+        new AlertDialog.Builder(this)
+                .setTitle("Confirm Deletion")
+                .setMessage("Are you sure you want to delete " + filesToDelete.size() + " item(s)?")
+                .setPositiveButton("Delete", (dialog, which) -> {
+                    // Thực hiện xóa trên luồng nền (quan trọng)
+                    executorService.execute(() -> {
+                        int successCount = 0;
+                        File parentOfFirst = filesToDelete.get(0).getParentFile(); // Để refresh
+                        for (File file : filesToDelete) {
+                            if (deleteRecursiveInternal(file)) { // Sử dụng hàm xóa đệ quy hiện có
+                                successCount++;
+                            } else {
+                                Log.e(TAG, "Failed to delete: " + file.getAbsolutePath());
+                                // Có thể hiển thị lỗi cho từng file
+                            }
+                        }
+                        final int finalSuccessCount = successCount;
+                        mainThreadHandler.post(() -> {
+                            Toast.makeText(this, finalSuccessCount + " item(s) deleted.", Toast.LENGTH_SHORT).show();
+                            if (finalSuccessCount > 0 && parentOfFirst != null) {
+                                onOperationComplete(parentOfFirst);
+                            } else if (finalSuccessCount > 0) {
+                                onOperationComplete(new File(currentPath));
+                            }
+                        });
+                    });
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+    private void handleCopySelected(List<File> filesToCopy) {
+        if (filesToCopy.isEmpty()) return;
+        // Ví dụ: nếu bạn quyết định copy từng file và mở FolderPicker cho file đầu tiên
+        if (!filesToCopy.isEmpty()) {
+            // Đặt trạng thái cho copy và file đầu tiên
+            this.fileToOperatePending = filesToCopy; // Chỉ ví dụ, bạn cần xử lý list
+            this.pendingOperation = OperationType.COPY;
+
+            Intent intent = new Intent(this, FolderPickerActivity.class);
+            intent.putExtra(FolderPickerActivity.EXTRA_SOURCE_PATH_TO_MOVE, filesToCopy.get(0).getAbsolutePath());
+            intent.putExtra(FolderPickerActivity.EXTRA_INITIAL_PATH, currentPath);
+            customFolderPickerLauncher.launch(intent);
+        }
+    }
+    private void handleCompressSelected(List<File> filesToCompress) {
+        if (filesToCompress.isEmpty()) {
+            Log.d(TAG, "handleCompressSelected: No files selected.");
+            return;
+        }
+        File parentDir = new File(currentPath);
+        // Kiểm tra thư mục cha và quyền ghi sớm
+        if (!parentDir.exists() || !parentDir.isDirectory() || !parentDir.canWrite()) {
+            Toast.makeText(this, "Cannot create compressed file in the current directory (check permissions or path).", Toast.LENGTH_LONG).show();
+            Log.e(TAG, "handleCompressSelected: Invalid or non-writable parent directory: " + currentPath);
+            return;
+        }
+        String zipFileName; // Khai báo biến
+            String baseName = filesToCompress.get(0).getName();
+            if(filesToCompress.size() == 1){
+                zipFileName = baseName + ".zip";
+            } else {
+                zipFileName = baseName + "_and_" + (filesToCompress.size() - 1) + "_more.zip";
+            }
+            ProgressDialog progressDialog = new ProgressDialog(this);
+            progressDialog.setTitle("Compressing");
+            progressDialog.setMessage("Preparing to compress to '" + zipFileName + "'...");
+            progressDialog.setCancelable(false);
+            progressDialog.setIndeterminate(true); // Hoặc false nếu bạn có thể tính %
+            progressDialog.show();
+
+        // Sao chép danh sách để tránh ConcurrentModificationException nếu filesToCompress có thể bị thay đổi
+        final List<File> itemsToProcess = new ArrayList<>(filesToCompress);
+        final String initialZipName = zipFileName; // Lưu tên ban đầu để dùng trong luồng nền
+
+            executorService.execute(() -> {
+                boolean success = true; // Giả sử thành công
+                String errorMessage = "Failed to compress items."; // Thông báo lỗi mặc định
+                File destinationZipFile = new File(parentDir, initialZipName); // Dùng initialZipName
+                destinationZipFile = getUniqueDestinationFile(destinationZipFile); // Xử lý trùng tên
+                final String finalActualZipName = destinationZipFile.getName(); // Tên file zip thực tế sau khi xử lý trùng
+
+                // Cập nhật message của ProgressDialog với tên file zip thực tế
+                mainThreadHandler.post(() -> {
+                    if (progressDialog.isShowing()) {
+                        progressDialog.setMessage("Compressing to '" + finalActualZipName + "'...");
+                    }
+                });
+
+                try (FileOutputStream fos = new FileOutputStream(destinationZipFile);
+                     ZipOutputStream zos = new ZipOutputStream(new BufferedOutputStream(fos))) {
+
+                    int itemCount = 0;
+                    for (File item : itemsToProcess) {
+                        itemCount++;
+                        final int currentItemNum = itemCount;
+                        final String itemName = item.getName();
+                        //Cập nhật tiến trình chi tiết hơn
+                        mainThreadHandler.post(() -> {
+                            if (progressDialog.isShowing()) {
+                                progressDialog.setMessage("Adding: " + itemName + "\n(" + currentItemNum + "/" + itemsToProcess.size() + ")");
+                            }
+                        });
+                        if (item.isDirectory()) {
+                            addFolderToZip(item, item.getName(), zos);
+                        } else {
+                            addFileToZip(item, item.getName(), zos);
+                        }
+                    }
+                    // zos.close() sẽ được gọi bởi try-with-resources
+                } catch (IOException e) {
+                    Log.e(TAG, "IOException during compression to " + finalActualZipName, e);
+                    success = false;
+                    errorMessage = "Error during compression: " + e.getMessage();
+                    destinationZipFile.delete(); // Xóa file zip lỗi
+                } catch (SecurityException e) {
+                    Log.e(TAG, "SecurityException during compression to " + finalActualZipName, e);
+                    success = false;
+                    errorMessage = "Permission denied during compression.";
+                    destinationZipFile.delete();
+                } catch (Exception e) {
+                    Log.e(TAG, "Unexpected error during compression to " + finalActualZipName, e);
+                    success = false;
+                    errorMessage = "An unexpected error occurred during compression.";
+                    destinationZipFile.delete();
+                }
+
+                final boolean finalSuccess = success;
+                final String finalMessage = success ? "Compressed " + filesToCompress.size() + " items to " + destinationZipFile.getName() : "Failed to compress items.";
+
+                mainThreadHandler.post(()->{
+                    if (progressDialog.isShowing()) {
+                        progressDialog.dismiss();
+                    }
+                    Toast.makeText(this, finalMessage, Toast.LENGTH_LONG).show();
+                    if(finalSuccess){
+                        onOperationComplete(parentDir);
+                    }
+                });
+
+            });
+        }
+        private void addFolderToZip(File folder, String baseEntryPath, ZipOutputStream zos) throws IOException {
+        File[] files = folder.listFiles();
+        if (files == null) {
+            Log.w(TAG, "Cannot list files in folder (permissions?): " + folder.getAbsolutePath());
+            return; // Bỏ qua thư mục không thể đọc
+        }
+
+        // Thêm entry cho chính thư mục này (quan trọng để giữ cấu trúc)
+        // Đảm bảo tên entry kết thúc bằng "/"
+        String folderEntry = baseEntryPath.endsWith("/") ? baseEntryPath : baseEntryPath + "/";
+        if (!folderEntry.isEmpty() && !folderEntry.equals("/")){ // Không thêm entry rỗng nếu baseEntryPath là "" (trường hợp gốc)
+            try {
+                zos.putNextEntry(new ZipEntry(folderEntry));
+                zos.closeEntry();
+            } catch (Exception e){
+                // Có thể xảy ra nếu entry đã tồn tại (ít khả năng với ZipOutputStream mới)
+                Log.w(TAG, "Could not add folder entry: " + folderEntry, e);
+            }
+        }
+
+
+        for (File file : files) {
+            String entryName = baseEntryPath + "/" + file.getName();
+            if (file.isDirectory()) {
+                addFolderToZip(file, entryName, zos);
+            } else {
+                addFileToZip(file, entryName, zos);
+            }
+        }
+    }
+        private void addFileToZip(File file, String entryName, ZipOutputStream zos) throws IOException {
+        byte[] buffer = new byte[4096]; // Buffer 4KB
+        FileInputStream fis = new FileInputStream(file);
+        BufferedInputStream bis = new BufferedInputStream(fis, buffer.length);
+
+        // Đảm bảo entry name không bắt đầu bằng / (thường không cần thiết với cách xây dựng ở trên)
+        if(entryName.startsWith("/")) {
+            entryName = entryName.substring(1);
+        }
+
+        ZipEntry zipEntry = new ZipEntry(entryName);
+        zos.putNextEntry(zipEntry);
+
+        int bytesRead;
+        while ((bytesRead = bis.read(buffer, 0, buffer.length)) != -1) {
+            zos.write(buffer, 0, bytesRead);
+        }
+        zos.closeEntry();
+        bis.close();
+        fis.close();
+    }
+      private void extractItem(File zipFile) {
+        File parentDir = zipFile.getParentFile();
+        if (parentDir == null) {
+            Toast.makeText(this, "Cannot extract file in root directory.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        String baseName = zipFile.getName();
+        int dotIndex = baseName.lastIndexOf('.');
+        if (dotIndex > 0) {
+            baseName = baseName.substring(0, dotIndex);
+        }
+
+        String extractDirName = baseName + "_extracted";
+        File extractDir = new File(parentDir, extractDirName);
+
+        // Xử lý trường hợp thư mục giải nén đã tồn tại
+        int count = 1;
+        while (extractDir.exists()) {
+            extractDirName = baseName + "_extracted_" + count;
+            extractDir = new File(parentDir, extractDirName);
+            count++;
+        }
+
+        // Hiển thị dialog tiến trình
+        ProgressDialog progressDialog = new ProgressDialog(this);
+        progressDialog.setTitle("Extracting");
+        progressDialog.setMessage("Extracting '" + zipFile.getName() + "'...");
+        progressDialog.setCancelable(false);
+        progressDialog.setIndeterminate(true);
+        progressDialog.show();
+
+        final File finalExtractDir = extractDir; // Biến final
+        executorService.execute(() -> {
+            boolean success = false;
+            String errorMessage = "Extraction failed.";
+            ZipInputStream zis = null;
+            try {
+                if (!finalExtractDir.mkdirs()) {
+                    // Thử tạo lại nếu cần, hoặc báo lỗi nếu không tạo được thư mục đích
+                    if(!finalExtractDir.exists() || !finalExtractDir.isDirectory()){
+                        throw new IOException("Could not create extraction directory: " + finalExtractDir.getAbsolutePath());
+                    }
+                }
+
+                FileInputStream fis = new FileInputStream(zipFile);
+                zis = new ZipInputStream(new BufferedInputStream(fis));
+                ZipEntry zipEntry;
+                byte[] buffer = new byte[4096];
+
+                while ((zipEntry = zis.getNextEntry()) != null) {
+                    File newFile = new File(finalExtractDir, zipEntry.getName());
+
+                    // Ngăn chặn lỗ hổng Zip Slip
+                    if (!newFile.getCanonicalPath().startsWith(finalExtractDir.getCanonicalPath() + File.separator)) {
+                        throw new IOException("Zip entry is trying to escape the target directory: " + zipEntry.getName());
+                    }
+
+
+                    // Tạo thư mục cha nếu cần thiết
+                    if (zipEntry.isDirectory()) {
+                        if (!newFile.mkdirs() && !newFile.isDirectory()) {
+                            Log.w(TAG, "Failed to create directory: " + newFile.getAbsolutePath());
+                            // Có thể tiếp tục hoặc báo lỗi tùy theo yêu cầu
+                        }
+                    } else {
+                        // Tạo thư mục cha cho file nếu chưa tồn tại
+                        File parent = newFile.getParentFile();
+                        if (parent != null && !parent.exists()) {
+                            if (!parent.mkdirs() && !parent.isDirectory()) {
+                                throw new IOException("Could not create parent directory: " + parent.getAbsolutePath());
+                            }
+                        }
+
+                        // Ghi file
+                        FileOutputStream fos = new FileOutputStream(newFile);
+                        BufferedOutputStream bos = new BufferedOutputStream(fos, buffer.length);
+                        int len;
+                        while ((len = zis.read(buffer)) > 0) {
+                            bos.write(buffer, 0, len);
+                        }
+                        bos.close();
+                        fos.close();
+                    }
+                    zis.closeEntry();
+                }
+                zis.closeEntry(); // Đảm bảo entry cuối cùng đóng lại
+                success = true;
+            } catch (IOException e) {
+                Log.e(TAG, "IOException during extraction", e);
+                errorMessage = "Extraction failed: I/O Error or Corrupt ZIP.";
+                // Cố gắng xóa thư mục giải nén bị lỗi
+                deleteRecursiveInternal(finalExtractDir);
+            } catch (SecurityException e) {
+                Log.e(TAG, "SecurityException during extraction", e);
+                errorMessage = "Extraction failed: Permission Denied.";
+                deleteRecursiveInternal(finalExtractDir);
+            } catch (Exception e) {
+                Log.e(TAG, "Unexpected error during extraction", e);
+                errorMessage = "An unexpected error occurred during extraction.";
+                deleteRecursiveInternal(finalExtractDir);
+            } finally {
+                if (zis != null) {
+                    try {
+                        zis.close(); // Luôn đóng ZipInputStream
+                    } catch (IOException e) {
+                        Log.e(TAG, "Error closing ZipInputStream", e);
+                    }
+                }
+            }
+
+            final boolean finalSuccess = success;
+            final String finalErrorMessage = errorMessage;
+
+            mainThreadHandler.post(() -> {
+                progressDialog.dismiss();
+                if (finalSuccess) {
+                    Toast.makeText(this, "Extracted successfully to " + finalExtractDir.getName(), Toast.LENGTH_SHORT).show();
+                    // Thông báo cho Activity/Fragment làm mới danh sách
+                    if (parentDir != null) {
+                        onOperationComplete(parentDir);
+                    }
+                } else {
+                    Toast.makeText(this, finalErrorMessage, Toast.LENGTH_LONG).show();
+                }
+            });
+        });
+    }
+    // --- Di chuyển và sửa đổi hàm showRenameDialog ---
+    private void showRenameDialog(final File fileToRename) { // Thêm final cho fileToRename
+        if (fileToRename == null || !fileToRename.exists()) {
+            Toast.makeText(this, "Cannot rename: Item not found.", Toast.LENGTH_SHORT).show();
+            Log.e(TAG, "showRenameDialog: fileToRename is null or does not exist.");
+            loadFilesAndFolders(); // Làm mới để đảm bảo UI đồng bộ
+            return;
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Rename Item");
+
+        // Set up the input field
+        final EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT);
+        input.setText(fileToRename.getName()); // Pre-fill with current name
+        input.selectAll(); // Select text for easy replacement
+        builder.setView(input);
+
+        // Set up the buttons
+        builder.setPositiveButton("Rename", (dialog, which) -> {
+            String newName = input.getText().toString().trim();
+
+            // --- Validation ---
+            if (newName.isEmpty()) {
+                Toast.makeText(this, "Name cannot be empty.", Toast.LENGTH_SHORT).show();
+                // Để giữ dialog mở, bạn cần ngăn dialog tự đóng.
+                // Cách đơn giản là người dùng phải mở lại dialog nếu nhập sai.
+                return;
+            }
+            if (newName.equals(fileToRename.getName())) {
+                // Không có thay đổi, chỉ đóng dialog
+                return;
+            }
+            if (newName.contains("/") || newName.contains("\\") || newName.contains(":")) { // Thêm các ký tự không hợp lệ khác nếu cần
+                Toast.makeText(this, "Name cannot contain invalid characters (e.g., /, \\, : ).", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            File parentDirectory = fileToRename.getParentFile();
+            if (parentDirectory == null) {
+                Toast.makeText(this, "Cannot rename item: Unable to determine parent directory.", Toast.LENGTH_SHORT).show();
+                Log.e(TAG,"Cannot get parent directory for renaming: "+ fileToRename.getAbsolutePath());
+                return;
+            }
+            if (!parentDirectory.canWrite()) {
+                Toast.makeText(this, "Cannot rename: No write permission in parent directory.", Toast.LENGTH_LONG).show();
+                Log.e(TAG, "No write permission in parent directory: " + parentDirectory.getAbsolutePath());
+                return;
+            }
+
+
+            File newFile = new File(parentDirectory, newName);
+            if (newFile.exists()) {
+                Toast.makeText(this, "An item with this name already exists in this folder.", Toast.LENGTH_LONG).show();
+                return;
+            }
+
+            // --- Attempt Rename on Background Thread ---
+            // Sử dụng executorService của FileListActivity
+            executorService.execute(() -> {
+                boolean success = false;
+                String errorMessage = "Rename failed. Check permissions or storage."; // Default error
+
+                try {
+                    if (fileToRename.renameTo(newFile)) {
+                        success = true;
+                    } else {
+                        // renameTo có thể thất bại vì nhiều lý do (quyền, khác filesystem, file đang mở...)
+                        Log.e(TAG, "OS renameTo failed for: " + fileToRename.getAbsolutePath() + " to " + newFile.getAbsolutePath());
+                        // Kiểm tra lại sự tồn tại để tránh thông báo lỗi sai
+                        if (newFile.exists()) { // Nếu renameTo thành công nhưng trả về false (ít khả năng)
+                            success = true;
+                        }
+                    }
+                } catch (SecurityException e) {
+                    Log.e(TAG, "Rename permission denied for: " + fileToRename.getAbsolutePath(), e);
+                    errorMessage = "Rename failed: Permission denied.";
+                } catch (Exception e){ // Bắt các lỗi không mong muốn khác
+                    Log.e(TAG, "Error during rename of: " + fileToRename.getAbsolutePath(), e);
+                    errorMessage = "An unexpected error occurred during rename.";
+                }
+
+                final boolean finalSuccess = success;
+                final String finalErrorMessage = errorMessage;
+
+                // Sử dụng mainThreadHandler của FileListActivity
+                mainThreadHandler.post(() -> {
+                    if (finalSuccess) {
+                        Toast.makeText(this, "'" + fileToRename.getName() + "' renamed to '" + newName + "' successfully.", Toast.LENGTH_SHORT).show();
+                        // --- Làm mới danh sách tệp ---
+                        loadFilesAndFolders(); // Cách đơn giản nhất là làm mới toàn bộ thư mục hiện tại
+                        // Không cần cập nhật adapter trực tiếp nữa vì loadFilesAndFolders sẽ làm điều đó.
+                    } else {
+                        Toast.makeText(this, finalErrorMessage, Toast.LENGTH_LONG).show();
+                        // Nếu thất bại, có thể cũng nên làm mới để đảm bảo UI đồng bộ (ví dụ fileToRename có thể đã bị xóa bởi tiến trình khác)
+                        loadFilesAndFolders();
+                    }
+                });
+            });
+        });
+        builder.setNegativeButton("Cancel", (dialog, which) -> dialog.cancel());
+
+        AlertDialog dialog = builder.create(); // Tạo dialog
+        dialog.show(); // Hiển thị dialog
+
+        input.requestFocus();
     }
 
     /**
@@ -333,7 +969,7 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
             } else {
                 // This case shouldn't happen if initialized correctly in onCreate
                 Log.e(TAG,"Adapter is null during loadFilesAndFolders");
-                adapter = new MyAdapter(this, fileList, this);
+                adapter = new MyAdapter(this, fileList);
                 recyclerView.setAdapter(adapter);
             }
         }
@@ -432,43 +1068,25 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
         runOnUiThread(this::loadFilesAndFolders);
     }
 
-    /**
-     * Callback method from {@link FileOperationListener} (implemented by this Activity).
-     * Called when the user selects the "Move" option from the adapter's context menu.
-     * It stores the file/folder to be moved and launches the {@link FolderPickerActivity}
-     * to allow the user to select the destination directory.
-     *
-     * @param fileToMove The {@link File} object selected by the user for moving.
-     */
-    @Override
-    public void onRequestMove(File fileToMove) {
-        if (fileToMove == null) {
+    public void handleMoveSelected(List<File> filesToMove) {
+        if (filesToMove.isEmpty()) {
             Log.e(TAG, "onRequestMove called with null file.");
             return;
         }
-        if (!fileToMove.exists()){
-            Toast.makeText(this, "Cannot move: Source file not found.", Toast.LENGTH_SHORT).show();
-            Log.e(TAG, "onRequestMove: Source file does not exist: " + fileToMove.getAbsolutePath());
-            refreshFileList(); // Refresh in case it was deleted elsewhere
+        if (!filesToMove.isEmpty()){
+            this.pendingOperation = OperationType.MOVE;
+            this.fileToOperatePending = filesToMove;
+            Intent intent = new Intent(this, FolderPickerActivity.class);
+            intent.putExtra(FolderPickerActivity.EXTRA_SOURCE_PATH_TO_MOVE, filesToMove.get(0).getAbsolutePath());
+            intent.putExtra(FolderPickerActivity.EXTRA_INITIAL_PATH, currentPath);
+            try {
+                customFolderPickerLauncher.launch(intent); // Use the launcher to start and get result
+            } catch (ActivityNotFoundException e) {
+                Log.e(TAG, "FolderPickerActivity not found!", e);
+                Toast.makeText(this, "Error: Folder Picker component is missing.", Toast.LENGTH_LONG).show();
+                this.fileToOperatePending = null; // Clear pending state as picker cannot be launched
+            }
             return;
-        }
-
-        Log.d(TAG, "Move requested for: " + fileToMove.getAbsolutePath());
-        this.fileToOperatePending = fileToMove; // Store the file awaiting destination
-
-        // --- Launch Custom Folder Picker ---
-        Intent intent = new Intent(this, FolderPickerActivity.class);
-        // Pass the source path to the picker (optional, for display/validation)
-        intent.putExtra(FolderPickerActivity.EXTRA_SOURCE_PATH_TO_MOVE, fileToMove.getAbsolutePath());
-        // Start the picker in the current directory for convenience
-        intent.putExtra(FolderPickerActivity.EXTRA_INITIAL_PATH, currentPath);
-
-        try {
-            customFolderPickerLauncher.launch(intent); // Use the launcher to start and get result
-        } catch (ActivityNotFoundException e) {
-            Log.e(TAG, "FolderPickerActivity not found!", e);
-            Toast.makeText(this, "Error: Folder Picker component is missing.", Toast.LENGTH_LONG).show();
-            this.fileToOperatePending = null; // Clear pending state as picker cannot be launched
         }
     }
 
@@ -482,45 +1100,78 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
      * @param sourceFile      The file or folder to move.
      * @param destinationDir The target directory where the source should be moved into.
      */
-    private void handleMoveOperationFileBased(File sourceFile, File destinationDir) {
-        Log.d(TAG, "Attempting File-based move: Source=" + sourceFile.getAbsolutePath() + ", DestinationDir=" + destinationDir.getAbsolutePath());
+    /**
+     * Thực hiện thao tác di chuyển tệp hoặc thư mục.
+     * Cố gắng renameTo trước, nếu thất bại sẽ fallback sang copy rồi delete.
+     * Tự xử lý các ngoại lệ và trả về boolean.
+     *
+     * @param sourceFile      Tệp hoặc thư mục nguồn cần di chuyển.
+     * @param destinationDir  Thư mục đích nơi nguồn sẽ được di chuyển vào.
+     * @return true nếu di chuyển thành công, false nếu thất bại.
+     */
+    private boolean handleMoveOperationInternal(File sourceFile, File destinationDir) {
+        Log.d(TAG, "Attempting Internal move: Source=" + sourceFile.getAbsolutePath() + ", DestinationDir=" + destinationDir.getAbsolutePath());
 
         // --- Pre-Move Validation ---
-        if (!destinationDir.exists() || !destinationDir.isDirectory()) {
-            Toast.makeText(this, "Move failed: Invalid destination directory.", Toast.LENGTH_LONG).show();
-            Log.e(TAG, "Move failed: Destination does not exist or is not a directory: " + destinationDir.getAbsolutePath());
-            return;
+        // Các kiểm tra này vẫn quan trọng và nên hiển thị Toast ngay lập tức nếu có vấn đề
+        // vì chúng là lỗi logic hoặc quyền cơ bản, không phải lỗi I/O trong quá trình di chuyển.
+        if (sourceFile == null || !sourceFile.exists()) {
+            final String msg = "Move failed: Source file does not exist.";
+            Log.e(TAG, msg + " Path: " + (sourceFile != null ? sourceFile.getAbsolutePath() : "null"));
+            mainThreadHandler.post(() -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show());
+            return false;
+        }
+        if (destinationDir == null || !destinationDir.exists() || !destinationDir.isDirectory()) {
+            final String msg = "Move failed: Invalid destination directory.";
+            Log.e(TAG, msg + " Path: " + (destinationDir != null ? destinationDir.getAbsolutePath() : "null"));
+            mainThreadHandler.post(() -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show());
+            return false;
         }
         if (!destinationDir.canWrite()) {
-            // Provide more specific feedback if possible
+            final String permMsg;
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED && Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-                Toast.makeText(this, "Move failed: Write Permission Required for destination.", Toast.LENGTH_LONG).show();
+                permMsg = "Move failed: Write Permission Required for destination.";
             } else {
-                Toast.makeText(this, "Move failed: Cannot write to destination directory.", Toast.LENGTH_LONG).show();
+                permMsg = "Move failed: Cannot write to destination directory.";
             }
-            Log.e(TAG, "Move failed: Cannot write to destination: " + destinationDir.getAbsolutePath());
-            return;
+            Log.e(TAG, permMsg + " Path: " + destinationDir.getAbsolutePath());
+            mainThreadHandler.post(() -> Toast.makeText(this, permMsg, Toast.LENGTH_LONG).show());
+            return false;
         }
 
         File newLocation = new File(destinationDir, sourceFile.getName());
 
+        // Xử lý trùng tên: Thay vì báo lỗi và dừng, bạn có thể tạo tên duy nhất
+        // hoặc cho phép người dùng chọn ghi đè/bỏ qua/đổi tên (phức tạp hơn)
+        // Hiện tại, chúng ta vẫn báo lỗi và dừng nếu tên đã tồn tại.
         if (newLocation.exists()) {
-            Toast.makeText(this, "Move failed: An item with the same name already exists in the destination.", Toast.LENGTH_LONG).show();
-            Log.w(TAG, "Move failed: Target location already exists: " + newLocation.getAbsolutePath());
-            return;
+            final String msg = "Move failed: An item with the same name already exists in the destination: " + newLocation.getName();
+            Log.w(TAG, msg + " Path: " + newLocation.getAbsolutePath());
+            mainThreadHandler.post(() -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show());
+            return false;
         }
 
-        // Prevent moving a directory into itself or a subdirectory of itself
-        if (sourceFile.isDirectory() && newLocation.getAbsolutePath().startsWith(sourceFile.getAbsolutePath() + File.separator)) {
-            Toast.makeText(this, "Cannot move a folder into itself or one of its subfolders.", Toast.LENGTH_LONG).show();
-            Log.w(TAG, "Move failed: Attempt to move directory into itself/subdirectory.");
-            return;
-        }
-        // Prevent moving if source and destination are effectively the same
-        if (newLocation.getAbsolutePath().equals(sourceFile.getAbsolutePath())){
-            Toast.makeText(this, "Source and destination are the same.", Toast.LENGTH_SHORT).show();
-            Log.w(TAG, "Move skipped: Source and destination are identical.");
-            return;
+        try {
+            // Prevent moving a directory into itself or a subdirectory of itself
+            if (sourceFile.isDirectory() && newLocation.getCanonicalPath().startsWith(sourceFile.getCanonicalPath() + File.separator)) {
+                final String msg = "Cannot move a folder into itself or one of its subfolders.";
+                Log.w(TAG, msg);
+                mainThreadHandler.post(() -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show());
+                return false;
+            }
+            // Prevent moving if source and destination are effectively the same (sau khi giải quyết đường dẫn chuẩn)
+            if (newLocation.getCanonicalPath().equals(sourceFile.getCanonicalPath())) {
+                // Thường thì kiểm tra trùng tên ở trên đã bắt được trường hợp này nếu tên giống nhau.
+                // Trường hợp này có thể xảy ra nếu tên khác nhau nhưng đường dẫn chuẩn giống nhau (ví dụ symlink).
+                final String msg = "Source and destination are the same.";
+                Log.w(TAG, msg);
+                // mainThreadHandler.post(() -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show());
+                return true; // Không làm gì cả, coi như thành công vì đã ở đúng chỗ.
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "IOException while checking canonical paths for move: " + sourceFile.getName(), e);
+            mainThreadHandler.post(() -> Toast.makeText(this, "Move failed: Error resolving file paths.", Toast.LENGTH_LONG).show());
+            return false;
         }
 
 
@@ -530,111 +1181,58 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
         // 1. Attempt atomic renameTo (preferred method)
         try {
             if (sourceFile.renameTo(newLocation)) {
-                Log.d(TAG, "Move successful using renameTo.");
+                Log.d(TAG, "Move successful for " + sourceFile.getName() + " using renameTo.");
                 moveSuccessful = true;
             } else {
-                Log.w(TAG, "renameTo failed for " + sourceFile.getName() + ". Filesystem boundary or permission issue? Falling back to copy/delete.");
-                // renameTo commonly fails across different physical volumes/mount points.
+                Log.w(TAG, "renameTo failed for " + sourceFile.getName() + ". Falling back to copy/delete.");
+                // Không ném lỗi ở đây, sẽ thử fallback
             }
         } catch (SecurityException e) {
-            Log.e(TAG,"SecurityException during renameTo for " + sourceFile.getName(), e);
-            // SecurityException might indicate a lack of write permission somewhere in the path
-        } catch (Exception e) {
-            // Catch unexpected errors during renameTo
-            Log.e(TAG, "Unexpected Exception during renameTo for " + sourceFile.getName(), e);
+            Log.e(TAG, "SecurityException during renameTo for " + sourceFile.getName() + ". Falling back.", e);
+            // Không ném lỗi, sẽ thử fallback
+        } catch (Exception e) { // Bắt các lỗi không mong muốn khác
+            Log.e(TAG, "Unexpected Exception during renameTo for " + sourceFile.getName() + ". Falling back.", e);
+            // Không ném lỗi, sẽ thử fallback
         }
 
 
         // 2. Fallback: Manual Copy and Delete (if renameTo failed)
         if (!moveSuccessful) {
-            Log.d(TAG,"Attempting manual copy/delete fallback for move operation.");
-            try {
-                copyFileOrDirectoryRecursive(sourceFile, newLocation); // Copy source to destination
-                // Verify copy (optional but recommended for critical data)
-                if (newLocation.exists()){ // Basic check
-                    Log.d(TAG,"Manual copy appears successful for: "+ sourceFile.getName());
-                    if (deleteRecursiveUsingFileApi(sourceFile)) { // Delete the original source
-                        Log.d(TAG,"Manual delete of source successful: "+ sourceFile.getName());
-                        moveSuccessful = true;
-                    } else {
-                        // Critical failure: Copied but couldn't delete original. Requires cleanup.
-                        Log.e(TAG, "CRITICAL MOVE FAILURE: Manual copy succeeded BUT FAILED to delete original source: " + sourceFile.getAbsolutePath());
-                        Toast.makeText(this, "Move incomplete: Copied, but failed to delete original.", Toast.LENGTH_LONG).show();
-                        // Attempt to clean up the partially moved file/folder at the destination
-                        Log.d(TAG,"Attempting cleanup of copied destination: "+ newLocation.getAbsolutePath());
-                        deleteRecursiveUsingFileApi(newLocation);
-                    }
+            Log.d(TAG, "Attempting manual copy/delete fallback for move of " + sourceFile.getName());
+            // Gọi hàm copyFileOrDirectoryRecursiveInternal đã được sửa đổi (trả về boolean)
+            if (copyFileOrDirectoryRecursiveInternal(sourceFile, newLocation)) {
+                Log.d(TAG, "Manual copy successful for: " + sourceFile.getName());
+                // Gọi hàm deleteRecursiveInternal đã được sửa đổi (trả về boolean)
+                if (deleteRecursiveInternal(sourceFile)) {
+                    Log.d(TAG, "Manual delete of source successful: " + sourceFile.getName());
+                    moveSuccessful = true;
                 } else {
-                    Log.e(TAG, "Manual copy phase failed or did not create the destination: " + newLocation.getAbsolutePath());
-                    Toast.makeText(this, "Move failed during copy phase.", Toast.LENGTH_LONG).show();
-                    // Ensure no partial destination exists
-                    deleteRecursiveUsingFileApi(newLocation);
+                    // Critical failure: Copied but couldn't delete original.
+                    Log.e(TAG, "CRITICAL MOVE FAILURE: Copied but FAILED to delete original source: " + sourceFile.getAbsolutePath());
+                    // Không hiển thị Toast ở đây nữa, hàm gọi sẽ hiển thị Toast tổng hợp
+                    // Cố gắng dọn dẹp (xóa file/thư mục đã copy ở đích)
+                    Log.d(TAG, "Attempting cleanup of copied destination: " + newLocation.getAbsolutePath());
+                    deleteRecursiveInternal(newLocation);
+                    // moveSuccessful vẫn là false
                 }
-
-            } catch (IOException e) {
-                Log.e(TAG, "IOException during manual copy/delete fallback for " + sourceFile.getName(), e);
-                Toast.makeText(this, "Move Error: Could not copy file/folder.", Toast.LENGTH_LONG).show();
-                // Attempt cleanup of potentially partial copy at destination
-                Log.d(TAG,"Attempting cleanup of potentially partial destination after IO error: "+ newLocation.getAbsolutePath());
-                deleteRecursiveUsingFileApi(newLocation);
-            } catch (SecurityException e) {
-                Log.e(TAG, "SecurityException during manual copy/delete fallback for " + sourceFile.getName(), e);
-                Toast.makeText(this, "Move Error: Permission denied during copy/delete.", Toast.LENGTH_LONG).show();
-                Log.d(TAG,"Attempting cleanup of potentially partial destination after Security error: "+ newLocation.getAbsolutePath());
-                deleteRecursiveUsingFileApi(newLocation);
-            } catch (Exception e) {
-                Log.e(TAG, "Unexpected Exception during manual copy/delete fallback for " + sourceFile.getName(), e);
-                Toast.makeText(this, "An unexpected error occurred during the move.", Toast.LENGTH_LONG).show();
-                Log.d(TAG,"Attempting cleanup of potentially partial destination after unexpected error: "+ newLocation.getAbsolutePath());
-                deleteRecursiveUsingFileApi(newLocation);
+            } else {
+                Log.e(TAG, "Manual copy phase failed for: " + sourceFile.getName() + " to " + newLocation.getAbsolutePath());
+                // Hàm copyFileOrDirectoryRecursiveInternal đã log lỗi chi tiết.
+                // Không cần xóa newLocation ở đây vì copyFileOrDirectoryRecursiveInternal đã cố gắng làm điều đó nếu thất bại.
+                // moveSuccessful vẫn là false
             }
         }
 
-        // --- Post-Move Actions ---
+        // --- Post-Move Actions (Chỉ log, Toast sẽ được xử lý ở hàm gọi) ---
         if (moveSuccessful) {
             Log.i(TAG, "Move completed successfully for: " + sourceFile.getName() + " to " + destinationDir.getName());
-            Toast.makeText(this, "'" + sourceFile.getName() + "' moved successfully.", Toast.LENGTH_SHORT).show();
-            refreshFileList(); // Update the UI to reflect the change
+            // Không gọi refreshFileList() ở đây nữa. Hàm gọi sẽ làm điều đó.
         } else {
-            // If it failed after all attempts
             Log.e(TAG, "Move operation ultimately failed for: " + sourceFile.getName());
-            // Toast message should have been shown by the specific failure point
         }
+        return moveSuccessful;
     }
-    @Override
-    public void onRequestCopy(File fileToCopy) {
-        if (fileToCopy == null) {
-            Log.e(TAG, "onRequestCopy called with null file.");
-            return;
-        }
-        if (!fileToCopy.exists()) {
-            Toast.makeText(this, "Cannot copy: Source file not found.", Toast.LENGTH_SHORT).show();
-            Log.e(TAG, "onRequestCopy: Source file does not exist: " + fileToCopy.getAbsolutePath());
-            loadFilesAndFolders(); // Refresh lại list
-            return;
-        }
 
-        Log.d(TAG, "Copy requested for: " + fileToCopy.getAbsolutePath());
-        this.fileToOperatePending = fileToCopy;     // Sử dụng biến chung
-        this.pendingOperation = OperationType.COPY; // Đặt trạng thái
-
-        // --- Khởi chạy FolderPickerActivity tương tự như Move ---
-        Intent intent = new Intent(this, FolderPickerActivity.class);
-        // Vẫn dùng EXTRA_SOURCE_PATH_TO_MOVE cho mục đích validation bên trong Picker
-        intent.putExtra(FolderPickerActivity.EXTRA_SOURCE_PATH_TO_MOVE, fileToCopy.getAbsolutePath());
-        intent.putExtra(FolderPickerActivity.EXTRA_INITIAL_PATH, currentPath);
-
-        try {
-            customFolderPickerLauncher.launch(intent); // Sử dụng cùng launcher
-        } catch (ActivityNotFoundException e) {
-            Log.e(TAG, "FolderPickerActivity not found!", e);
-            Toast.makeText(this, "Error: Folder Picker component is missing.", Toast.LENGTH_LONG).show();
-            // Reset trạng thái nếu không mở được picker
-            this.fileToOperatePending = null;
-            this.pendingOperation = OperationType.NONE;
-        }
-    }
-    @Override
     public void onOperationComplete(File directoryAffected) {
         // Được gọi bởi Adapter sau khi nén, giải nén, xóa, đổi tên thành công
         Log.d("FileListActivity", "Operation complete notification received.");
@@ -657,12 +1255,6 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
                 Log.d("FileListActivity", "Refresh reason: Current path is inside the affected directory.");
                 shouldRefresh = true;
             }
-            // 3. (Tùy chọn) Làm mới nếu thư mục bị ảnh hưởng là cha trực tiếp
-            // (Hữu ích nếu bạn muốn cập nhật khi tên thư mục cha thay đổi chẳng hạn)
-            // else if (currentDirFile.getParentFile() != null && currentDirFile.getParentFile().equals(directoryAffected)) {
-            //     Log.d("FileListActivity", "Refresh reason: Affected directory is parent of current path.");
-            //     shouldRefresh = true;
-            // }
 
         } else {
             // 4. Làm mới như một fallback nếu không rõ thư mục nào bị ảnh hưởng
@@ -690,6 +1282,10 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
      */
     @Override
     public void onBackPressed() {
+        if (currentActionMode != null) {
+            currentActionMode.finish(); // Kết thúc ActionMode nếu đang mở
+            return; // Không thực hiện hành động back mặc định
+        }
         if (currentPath == null) {
             super.onBackPressed(); // Should not happen, but safety check
             return;
@@ -791,97 +1387,177 @@ public class FileListActivity extends AppCompatActivity implements FileOperation
         return file.getName().isEmpty() ? absolutePath : file.getName();
     }
 
-
-    private void copyFileOrDirectoryRecursive(File source, File destination) throws IOException, SecurityException {
-        if (source.isDirectory()) {
-            // Create destination directory if it doesn't exist
-            if (!destination.exists()) {
-                if (!destination.mkdirs()) {
-                    throw new IOException("Cannot create destination directory: " + destination.getAbsolutePath());
-                }
-                Log.d(TAG,"Created directory: "+ destination.getAbsolutePath());
-            } else if (!destination.isDirectory()) {
-                throw new IOException("Destination exists but is not a directory: " + destination.getAbsolutePath());
-            }
-
-            String[] children = source.list();
-            if (children == null) {
-                // This might happen due to I/O errors or lack of permissions mid-copy
-                throw new IOException("Cannot list source directory children: " + source.getAbsolutePath());
-            }
-            for (String child : children) {
-                copyFileOrDirectoryRecursive(new File(source, child), new File(destination, child));
-            }
-        } else {
-            // Copy file using streams
-            Log.d(TAG,"Copying file: "+ source.getName() + " to "+ destination.getParent());
-            try (InputStream in = new FileInputStream(source);
-                 OutputStream out = new FileOutputStream(destination)) { // Overwrites if exists
-                byte[] buffer = new byte[8192]; // 8KB buffer
-                int length;
-                while ((length = in.read(buffer)) > 0) {
-                    out.write(buffer, 0, length);
-                }
-            } catch (IOException e) {
-                Log.e(TAG,"IOException during file copy: " + source.getName(), e);
-                // Attempt to delete partially copied file at destination on error
-                if (destination.exists() && !destination.delete()) {
-                    Log.w(TAG, "Could not delete partially copied file: " + destination.getAbsolutePath());
-                }
-                throw e; // Re-throw the exception
-            } catch(SecurityException e){
-                Log.e(TAG,"SecurityException during file copy: " + source.getName(), e);
-                if (destination.exists() && !destination.delete()) {
-                    Log.w(TAG, "Could not delete partially copied file after security exception: " + destination.getAbsolutePath());
-                }
-                throw e; // Re-throw
-            }
-        }
-    }
-
-
-    private boolean deleteRecursiveUsingFileApi(File fileOrDirectory) {
-        if (!fileOrDirectory.exists()) {
-            return true; // Doesn't exist, considered deleted
+    /**
+     * Sao chép tệp hoặc thư mục (đệ quy) từ nguồn đến đích.
+     * Tự xử lý IOException và SecurityException bên trong và trả về boolean.
+     *
+     * @param source      Tệp hoặc thư mục nguồn.
+     * @param destination Tệp hoặc thư mục đích (sẽ được tạo nếu là thư mục nguồn).
+     * @return true nếu sao chép thành công hoàn toàn, false nếu có bất kỳ lỗi nào.
+     */
+    private boolean copyFileOrDirectoryRecursiveInternal(File source, File destination) {
+        // Kiểm tra cơ bản (bạn có thể thêm các kiểm tra khác nếu muốn)
+        if (source == null || destination == null) {
+            Log.e(TAG, "copyFileOrDirectoryRecursiveInternal: Source or destination is null.");
+            return false;
         }
 
-        if (fileOrDirectory.isDirectory()) {
-            File[] children = fileOrDirectory.listFiles();
-            if (children != null) {
-                for (File child : children) {
-                    if (!deleteRecursiveUsingFileApi(child)) {
-                        Log.w(TAG, "Failed to delete child: " + child.getAbsolutePath() + " during recursive delete of " + fileOrDirectory.getAbsolutePath());
-                        return false; // Stop if deletion of a child fails
-                    }
-                }
-            } else {
-                Log.w(TAG,"listFiles() returned null for directory: "+ fileOrDirectory.getAbsolutePath() + ". Cannot delete children.");
-                // Cannot proceed reliably if children cannot be listed
+        try {
+            // Ngăn chặn copy vào chính nó hoặc thư mục con (quan trọng cho thư mục)
+            if (source.getCanonicalPath().equals(destination.getCanonicalPath())) {
+                Log.e(TAG, "Source and destination are the same: " + source.getAbsolutePath());
+                // Tùy bạn quyết định đây có phải là lỗi không. Trong nhiều trường hợp, đây là lỗi.
+                // mainThreadHandler.post(() -> Toast.makeText(this, "Cannot copy: Source and destination are the same.", Toast.LENGTH_SHORT).show());
+                return true; // Hoặc true nếu bạn coi đây không phải lỗi
+            }
+            // Nếu nguồn là thư mục và đích nằm trong nguồn
+            if (source.isDirectory() && destination.getCanonicalPath().startsWith(source.getCanonicalPath() + File.separator)) {
+                Log.e(TAG, "Cannot copy a directory into itself or one of its subdirectories: " + source.getAbsolutePath() + " -> " + destination.getAbsolutePath());
+                // mainThreadHandler.post(() -> Toast.makeText(this, "Cannot copy folder into itself or a subfolder.", Toast.LENGTH_LONG).show());
                 return false;
             }
-        }
 
-        // Delete the file or the now-empty directory
-        boolean deleted = fileOrDirectory.delete();
-        if (!deleted) {
-            Log.e(TAG, "Failed to delete: " + fileOrDirectory.getAbsolutePath());
-        } else {
-            Log.d(TAG, "Deleted: " + fileOrDirectory.getAbsolutePath());
+
+            if (source.isDirectory()) {
+                // Tạo thư mục đích nếu chưa tồn tại
+                if (!destination.exists()) {
+                    if (!destination.mkdirs()) {
+                        Log.e(TAG, "Cannot create destination directory: " + destination.getAbsolutePath());
+                        return false; // Không thể tạo thư mục đích
+                    }
+                    Log.d(TAG, "Created directory: " + destination.getAbsolutePath());
+                } else if (!destination.isDirectory()) {
+                    Log.e(TAG, "Destination exists but is not a directory: " + destination.getAbsolutePath());
+                    return false; // Đích tồn tại nhưng không phải thư mục
+                }
+
+                String[] children = source.list();
+                if (children == null) {
+                    Log.e(TAG, "Cannot list source directory children (permissions or I/O error): " + source.getAbsolutePath());
+                    return false; // Lỗi khi liệt kê con
+                }
+
+                boolean allChildrenCopied = true;
+                for (String child : children) {
+                    // Gọi đệ quy và nếu bất kỳ con nào thất bại, đánh dấu thất bại chung
+                    if (!copyFileOrDirectoryRecursiveInternal(new File(source, child), new File(destination, child))) {
+                        allChildrenCopied = false;
+                        // Bạn có thể chọn dừng ngay tại đây (return false) hoặc tiếp tục copy các file khác
+                        // return false; // Dừng ngay nếu một file con lỗi
+                    }
+                }
+                return allChildrenCopied; // Trả về true nếu tất cả con được copy thành công
+
+            } else { // Nếu nguồn là một tệp
+                // Đảm bảo thư mục cha của tệp đích tồn tại
+                File parentDir = destination.getParentFile();
+                if (parentDir != null && !parentDir.exists()) {
+                    if (!parentDir.mkdirs()) {
+                        Log.e(TAG, "Cannot create parent directory for destination file: " + parentDir.getAbsolutePath());
+                        return false;
+                    }
+                }
+
+                Log.d(TAG, "Copying file: " + source.getName() + " to " + (parentDir != null ? parentDir.getAbsolutePath() : "unknown parent"));
+                try (InputStream in = new FileInputStream(source);
+                     OutputStream out = new FileOutputStream(destination)) { // Mặc định sẽ ghi đè nếu tệp đích đã tồn tại
+                    byte[] buffer = new byte[8192]; // 8KB buffer
+                    int length;
+                    while ((length = in.read(buffer)) > 0) {
+                        out.write(buffer, 0, length);
+                    }
+                    out.flush(); // Đảm bảo dữ liệu được ghi hết
+                }
+                // Nếu không có exception nào xảy ra trong try-with-resources, copy file thành công
+                return true;
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "IOException during copy: " + source.getAbsolutePath() + " -> " + destination.getAbsolutePath(), e);
+            // Cố gắng xóa tệp/thư mục đích có thể đã được tạo một phần
+            if (destination.exists()) {
+                deleteRecursiveInternal(destination); // Bạn cần một hàm deleteRecursiveInternal tương tự
+            }
+            return false; // Trả về false khi có lỗi I/O
+        } catch (SecurityException e) {
+            Log.e(TAG, "SecurityException during copy: " + source.getAbsolutePath() + " -> " + destination.getAbsolutePath(), e);
+            if (destination.exists()) {
+                deleteRecursiveInternal(destination);
+            }
+            return false; // Trả về false khi có lỗi bảo mật
+        } catch (Exception e) { // Bắt các lỗi không mong muốn khác
+            Log.e(TAG, "Unexpected exception during copy: " + source.getAbsolutePath() + " -> " + destination.getAbsolutePath(), e);
+            if (destination.exists()) {
+                deleteRecursiveInternal(destination);
+            }
+            return false;
         }
-        return deleted;
     }
 
-    // MimeType helper remains useful for potential future features, even if not used by current move logic
-    private String getMimeType(String filePath) {
-        String type = "application/octet-stream"; // Default fallback
-        String extension = MimeTypeMap.getFileExtensionFromUrl(Uri.fromFile(new File(filePath)).toString());
-        if (extension != null) {
-            String mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.toLowerCase());
-            if (mime != null) {
-                type = mime;
+    private boolean deleteRecursiveInternal(File fileOrDirectory) {
+        if (fileOrDirectory == null || !fileOrDirectory.exists()) {
+            return true; // Không có gì để xóa, hoặc đã bị xóa
+        }
+        try {
+            if (fileOrDirectory.isDirectory()) {
+                File[] children = fileOrDirectory.listFiles();
+                if (children != null) {
+                    for (File child : children) {
+                        if (!deleteRecursiveInternal(child)) {
+                            return false; // Nếu xóa con thất bại
+                        }
+                    }
+                }
+            }
+            return fileOrDirectory.delete();
+        } catch (SecurityException e) {
+            Log.e(TAG, "SecurityException while deleting: " + fileOrDirectory.getAbsolutePath(), e);
+            return false;
+        } catch (Exception e) {
+            Log.e(TAG, "Unexpected exception while deleting: " + fileOrDirectory.getAbsolutePath(), e);
+            return false;
+        }
+    }
+
+    private File getUniqueDestinationFile(File destination) {
+        if (!destination.exists()) {
+            return destination; // Tên chưa tồn tại, dùng luôn
+        }
+
+        File parent = destination.getParentFile();
+        String name = destination.getName();
+        String baseName;
+        String extension = "";
+
+        if (destination.isDirectory()) {
+            baseName = name;
+        } else {
+            int dotIndex = name.lastIndexOf('.');
+            if (dotIndex > 0) {
+                baseName = name.substring(0, dotIndex);
+                extension = name.substring(dotIndex); // Bao gồm cả dấu "."
+            } else {
+                baseName = name;
             }
         }
-        return type;
-    }
 
+        int count = 1;
+        File uniqueDestination;
+        do {
+            String newName = baseName + " (" + count + ")" + extension;
+            uniqueDestination = new File(parent, newName);
+            count++;
+        } while (uniqueDestination.exists());
+
+        Log.d(TAG, "Name conflict resolved. Original: " + destination.getName() + ", New: " + uniqueDestination.getName());
+        return uniqueDestination;
+    }
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (executorService != null && !executorService.isShutdown()) {
+            Log.d(TAG, "Shutting down ExecutorService.");
+            executorService.shutdown(); // Ngăn chặn tác vụ mới, hoàn thành tác vụ đang chạy
+            // Hoặc executorService.shutdownNow(); // Cố gắng dừng ngay các tác vụ đang chạy (có thể gây gián đoạn)
+        }
+    }
 } // End FileListActivity Class
